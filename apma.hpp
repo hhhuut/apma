@@ -11,6 +11,8 @@
 #include <assert.h>
 #endif
 
+#include "radix_spline.h"
+
 // Adaptive packed-memory array
 template <class KeyType, class ValueType>
 class pma
@@ -50,6 +52,7 @@ private:
 		}
 	};
 
+public:
 	// Iterator
 	class _pma_const_iterator
 	{
@@ -72,12 +75,12 @@ private:
 			_construct_display_element();
 		}
 
-		reference operator*()
+		reference operator*() const
 		{
 			return _val;
 		}
 
-		pointer operator->()
+		pointer operator->() const
 		{
 			return &_val;
 		}
@@ -154,6 +157,7 @@ private:
 		}
 	};
 
+private:
 	/* PMA constants */
 
 	// Reserve 8 bits to allow for fixed point arithmetic.
@@ -181,12 +185,16 @@ private:
 	double delta_low = (low_h - low_0) / tree_height; // Delta for lower density threshold
 	std::vector<_pma_storage> data_; // Underlying storage
 
+	bool is_indexed_ = true;
+	rs::RadixSpline<KeyType> rs_;
+
 public:
 	using const_iterator = _pma_const_iterator;
 
 	pma()
 	{
 		data_.resize(elem_capacity); // Initial size
+		construct_spline();
 	}
 	pma(const pma& rhs) { *this = rhs; }
 	pma(pma&& rhs) noexcept { *this = std::move(rhs); }
@@ -218,7 +226,6 @@ public:
 		} // end of for
 		spread(0, elem_capacity, num_elems);
 	}
-	~pma() = default;
 
 	pma& operator=(const pma& rhs)
 	{
@@ -230,6 +237,7 @@ public:
 		delta_up = rhs.delta_up;
 		delta_low = rhs.delta_low;
 		data_ = rhs.data_;
+		rs_ = rhs.rs_;
 		return (*this);
 	}
 	pma& operator=(pma&& rhs) noexcept
@@ -244,6 +252,7 @@ public:
 		delta_low = rhs.delta_low;
 
 		data_ = std::move(rhs.data_);
+		rs_ = std::move(rhs.rs_);
 
 		// Leave rhs in a default (but valid) state
 		rhs.clear();
@@ -276,6 +285,45 @@ public:
 
 		data_.clear();
 		data_.resize(elem_capacity);
+
+		construct_spline();
+	}
+
+	void construct_spline()
+	{
+		if (is_indexed_)
+			return;
+
+		if (num_elems == 0)
+		{
+			// Construct empty spline
+			rs::Builder<KeyType> rsb(std::numeric_limits<KeyType>::min(), std::numeric_limits<KeyType>::max());
+			rs_ = rsb.Finalize();
+		}
+		else
+		{
+			const auto min_key = begin()->first;
+			const auto max_key = (--end())->first;
+			auto prev_key = min_key - 1;
+
+			// Dirty-hack so that the index of "min_key" is its actual index and not always the first vector index.
+			rs::Builder<KeyType> rsb(prev_key, max_key);
+
+			for (auto iter = data_.begin(); iter != data_.end(); iter++)
+			{
+				if (iter->is_used)
+				{
+					rsb.AddKey(iter->key);
+					prev_key = iter->key;
+				}
+				else
+					rsb.AddKey(prev_key); // "dummy" key so that the bounds are correct.
+			} // end of for
+
+			rs_ = rsb.Finalize();
+		}
+
+		is_indexed_ = true;
 	}
 
 	/// <summary>
@@ -298,6 +346,71 @@ public:
 			return false;
 	}
 
+	bool radix_find_linear(KeyType key, ValueType& val)
+	{
+		construct_spline();
+
+		auto searchbound = rs_.GetSearchBound(key);
+		const auto end_it = data_.begin() + searchbound.end;
+
+		auto iter = std::find_if(data_.begin() + searchbound.begin,
+			end_it,
+			[key](const _pma_storage& _left) { return _left.is_used && _left.key == key; });
+
+		bool found = iter != end_it && iter->is_used && iter->key == key;
+
+		if (found)
+			val = iter->value;
+		return found;
+	}
+
+	bool radix_find_binary(KeyType key, ValueType& val)
+	{
+		construct_spline();
+
+		auto searchbound = rs_.GetSearchBound(key);
+
+		int64_t i;
+		// searchbound ist [from, to) but find expects [from, to]!
+		if (find_between(key, searchbound.begin, searchbound.end - 1, i))
+		{
+			val = data_[i].value;
+			return true;
+		}
+		else
+			return false;
+	}
+
+	bool radix_find_exponential(KeyType key, ValueType& val)
+	{
+		construct_spline();
+
+		auto searchbound = rs_.GetSearchBound(key);
+
+		const auto start_ = searchbound.begin;
+		const auto end_ = searchbound.end;
+
+		if ((end_ - start_) <= 0)
+			return false;
+
+		size_t bound = 1; // as 2^0 = 1
+
+		while (bound < (end_ - start_) && data_[start_ + bound].is_used && data_[start_ + bound].key < key)
+			bound *= 2; // bound will increase as power of 2
+
+		const auto offset = start_ + bound / 2;
+
+		int64_t i;
+		// searchbound is [from, to) but find expects [from, to]!
+		if (find_between(key, offset, end_ - 1, i))
+		{
+			val = data_[i].value;
+			return true;
+		}
+		else
+			return false;
+	}
+
 	/// <summary>
 	/// Remove the element with the given key.
 	/// </summary>
@@ -309,6 +422,7 @@ public:
 		if (find_at(key, i))
 		{
 			delete_at(i);
+			is_indexed_ = false;
 			return true;
 		}
 		else
@@ -327,6 +441,7 @@ public:
 		if (!find_at(key, i))
 		{
 			insert_after(i, key, val);
+			is_indexed_ = false;
 			return true;
 		}
 		else
@@ -522,12 +637,14 @@ private:
 	/// <returns>True if the key is present, otherwise false.</returns>
 	bool find_at(KeyType key, int64_t& index) const
 	{
+		return find_between(key, 0, elem_capacity - 1, index);
+	}
+
+	bool find_between(KeyType key, int64_t from, int64_t to, int64_t& index) const
+	{
 		// We're using signed indices here now since we need to perform
 		// relative indexing and the range checking is much easier and
 		// clearer with signed integral types.
-		int64_t from = 0;
-		int64_t to = elem_capacity - 1;
-
 		while (from <= to)
 		{
 			int64_t mid = from + (to - from) / 2;
