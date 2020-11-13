@@ -11,8 +11,6 @@
 #include <assert.h>
 #endif
 
-#include "radix_spline.h"
-
 // Adaptive packed-memory array
 template <class KeyType, class ValueType>
 class pma
@@ -56,10 +54,8 @@ public:
 	// Iterator
 	class _pma_const_iterator
 	{
-	private:
-		using raw_const_iterator = typename std::vector<_pma_storage>::const_iterator;
-
 	public:
+		using raw_const_iterator = typename std::vector<_pma_storage>::const_iterator;
 		using iterator_category = std::bidirectional_iterator_tag;
 		using value_type = std::pair<KeyType, ValueType>;
 		using difference_type = std::ptrdiff_t;
@@ -185,16 +181,12 @@ private:
 	double delta_low = (low_h - low_0) / tree_height; // Delta for lower density threshold
 	std::vector<_pma_storage> data_; // Underlying storage
 
-	bool is_indexed_ = true;
-	rs::RadixSpline<KeyType> rs_;
-
 public:
 	using const_iterator = _pma_const_iterator;
 
 	pma()
 	{
 		data_.resize(elem_capacity); // Initial size
-		construct_spline();
 	}
 	pma(const pma& rhs) { *this = rhs; }
 	pma(pma&& rhs) noexcept { *this = std::move(rhs); }
@@ -237,7 +229,6 @@ public:
 		delta_up = rhs.delta_up;
 		delta_low = rhs.delta_low;
 		data_ = rhs.data_;
-		rs_ = rhs.rs_;
 		return (*this);
 	}
 	pma& operator=(pma&& rhs) noexcept
@@ -252,7 +243,6 @@ public:
 		delta_low = rhs.delta_low;
 
 		data_ = std::move(rhs.data_);
-		rs_ = std::move(rhs.rs_);
 
 		// Leave rhs in a default (but valid) state
 		rhs.clear();
@@ -263,12 +253,12 @@ public:
 	size_t capacity() const { return elem_capacity; }
 	size_t size() const { return num_elems; }
 
-	const_iterator begin()
+	const_iterator begin() const
 	{
 		return const_iterator(data_.begin(), this);
 	}
 
-	const_iterator end()
+	const_iterator end() const
 	{
 		return const_iterator(data_.end(), this);
 	}
@@ -285,45 +275,6 @@ public:
 
 		data_.clear();
 		data_.resize(elem_capacity);
-
-		construct_spline();
-	}
-
-	void construct_spline()
-	{
-		if (is_indexed_)
-			return;
-
-		if (num_elems == 0)
-		{
-			// Construct empty spline
-			rs::Builder<KeyType> rsb(std::numeric_limits<KeyType>::min(), std::numeric_limits<KeyType>::max());
-			rs_ = rsb.Finalize();
-		}
-		else
-		{
-			const auto min_key = begin()->first;
-			const auto max_key = (--end())->first;
-			auto prev_key = min_key - 1;
-
-			// Dirty-hack so that the index of "min_key" is its actual index and not always the first vector index.
-			rs::Builder<KeyType> rsb(prev_key, max_key);
-
-			for (auto iter = data_.begin(); iter != data_.end(); iter++)
-			{
-				if (iter->is_used)
-				{
-					rsb.AddKey(iter->key);
-					prev_key = iter->key;
-				}
-				else
-					rsb.AddKey(prev_key); // "dummy" key so that the bounds are correct.
-			} // end of for
-
-			rs_ = rsb.Finalize();
-		}
-
-		is_indexed_ = true;
 	}
 
 	/// <summary>
@@ -346,71 +297,6 @@ public:
 			return false;
 	}
 
-	bool radix_find_linear(KeyType key, ValueType& val)
-	{
-		construct_spline();
-
-		auto searchbound = rs_.GetSearchBound(key);
-		const auto end_it = data_.begin() + searchbound.end;
-
-		auto iter = std::find_if(data_.begin() + searchbound.begin,
-			end_it,
-			[key](const _pma_storage& _left) { return _left.is_used && _left.key == key; });
-
-		bool found = iter != end_it && iter->is_used && iter->key == key;
-
-		if (found)
-			val = iter->value;
-		return found;
-	}
-
-	bool radix_find_binary(KeyType key, ValueType& val)
-	{
-		construct_spline();
-
-		auto searchbound = rs_.GetSearchBound(key);
-
-		int64_t i;
-		// searchbound ist [from, to) but find expects [from, to]!
-		if (find_between(key, searchbound.begin, searchbound.end - 1, i))
-		{
-			val = data_[i].value;
-			return true;
-		}
-		else
-			return false;
-	}
-
-	bool radix_find_exponential(KeyType key, ValueType& val)
-	{
-		construct_spline();
-
-		auto searchbound = rs_.GetSearchBound(key);
-
-		const auto start_ = searchbound.begin;
-		const auto end_ = searchbound.end;
-
-		if ((end_ - start_) <= 0)
-			return false;
-
-		size_t bound = 1; // as 2^0 = 1
-
-		while (bound < (end_ - start_) && data_[start_ + bound].is_used && data_[start_ + bound].key < key)
-			bound *= 2; // bound will increase as power of 2
-
-		const auto offset = start_ + bound / 2;
-
-		int64_t i;
-		// searchbound is [from, to) but find expects [from, to]!
-		if (find_between(key, offset, end_ - 1, i))
-		{
-			val = data_[i].value;
-			return true;
-		}
-		else
-			return false;
-	}
-
 	/// <summary>
 	/// Remove the element with the given key.
 	/// </summary>
@@ -422,7 +308,6 @@ public:
 		if (find_at(key, i))
 		{
 			delete_at(i);
-			is_indexed_ = false;
 			return true;
 		}
 		else
@@ -441,7 +326,6 @@ public:
 		if (!find_at(key, i))
 		{
 			insert_after(i, key, val);
-			is_indexed_ = false;
 			return true;
 		}
 		else
@@ -452,7 +336,7 @@ private:
 	/* Utility functions */
 
 	// Returns the 1-based index of the last (most significant) bit set in x.
-	inline uint64_t last_bit_set(uint64_t x) const
+	constexpr inline uint64_t last_bit_set(uint64_t x) const
 	{
 #ifdef _DEBUG
 		assert(x > 0);
@@ -464,17 +348,19 @@ private:
 #endif
 	}
 
-	inline uint64_t floor_log2(uint64_t x) const {
+	constexpr inline uint64_t floor_log2(uint64_t x) const
+	{
 		return (last_bit_set(x) - 1);
 		// i.e. floor_log2(13) = 3, floor_log2(27) = 4, etc.
 	}
 
-	inline uint64_t ceil_log2(uint64_t x) const {
+	constexpr inline uint64_t ceil_log2(uint64_t x) const
+	{
 		return (last_bit_set(x - 1));
 		// i.e. ceil_log2(13) = 4, ceil_log2(27) = 5, etc.
 	}
 
-	inline uint64_t ceil_div(uint64_t x, uint64_t y)
+	constexpr inline uint64_t ceil_div(uint64_t x, uint64_t y) const
 	{
 #ifdef _DEBUG
 		assert(x > 0);
@@ -483,20 +369,20 @@ private:
 	}
 
 	// Returns the largest power of 2 not greater than x ($2^{\lfloor \lg x \rfloor}$).
-	inline uint64_t hyperfloor(uint64_t x)
+	constexpr inline uint64_t hyperfloor(uint64_t x) const
 	{
 		return (1ULL << floor_log2(x));
 	}
 
 	// Returns the smallest power of 2 not less than x ($2^{\lceil \lg x \rceil}$).
-	inline uint64_t hyperceil(uint64_t x)
+	constexpr inline uint64_t hyperceil(uint64_t x) const
 	{
 		return (1ULL << ceil_log2(x));
 	}
 
 	/* Internal functions */
 
-	void compute_capacity()
+	constexpr void compute_capacity()
 	{
 		segment_size = (uint32_t)ceil_log2(num_elems); // Ideal segment size
 		segment_count = ceil_div(num_elems, segment_size); // Ideal number of segments
@@ -518,7 +404,7 @@ private:
 #endif
 	}
 
-	void pack(size_t from, size_t to, uint64_t n)
+	constexpr void pack(size_t from, size_t to, uint64_t n)
 	{
 		// [from, to)
 #ifdef _DEBUG
@@ -543,7 +429,7 @@ private:
 #endif
 	}
 
-	void spread(size_t from, size_t to, uint64_t n)
+	constexpr void spread(size_t from, size_t to, uint64_t n)
 	{
 		// [from, to)
 #ifdef _DEBUG
@@ -563,7 +449,7 @@ private:
 		} // end of while
 	}
 
-	void resize()
+	constexpr void resize()
 	{
 		pack(0, elem_capacity, num_elems);
 		compute_capacity();
@@ -576,7 +462,7 @@ private:
 		spread(0, elem_capacity, num_elems);
 	}
 
-	void rebalance(int64_t index)
+	constexpr void rebalance(int64_t index)
 	{
 		// We're using signed indices here now since we need to perform
 		// relative indexing and the range checking is much easier and
@@ -590,6 +476,7 @@ private:
 
 		do
 		{
+			// Repeatedly calculate window containing an increasing amount of segments
 			uint64_t window_size = segment_size * (1ULL << height);
 			uint64_t window = index / window_size;
 			window_start = window * window_size;
@@ -609,10 +496,12 @@ private:
 				++right_index;
 			} // end of while
 
+			// Now that we recorded all elements, we can use this occupancy to check if
+			// the current window can fulfill the density thresholds.
 			density = (double)occupancy / (double)window_size;
 			up_height = up_0 - (height * delta_up);
 			low_height = low_0 + (height * delta_low);
-			++height;
+			++height; // Go one level up in our conceptual PMA tree
 		} while ((density < low_height || density >= up_height) && height < tree_height);
 
 		if (density >= low_height && density < up_height)
@@ -635,12 +524,12 @@ private:
 	/// <param name="key">The key to search for.</param>
 	/// <param name="index">The index of the found element, the index of its predecessor or -1.</param>
 	/// <returns>True if the key is present, otherwise false.</returns>
-	bool find_at(KeyType key, int64_t& index) const
+	constexpr bool find_at(KeyType key, int64_t& index) const
 	{
 		return find_between(key, 0, elem_capacity - 1, index);
 	}
 
-	bool find_between(KeyType key, int64_t from, int64_t to, int64_t& index) const
+	constexpr bool find_between(KeyType key, int64_t from, int64_t to, int64_t& index) const
 	{
 		// We're using signed indices here now since we need to perform
 		// relative indexing and the range checking is much easier and
@@ -682,7 +571,7 @@ private:
 		return false;
 	}
 
-	void delete_at(int64_t i)
+	constexpr void delete_at(int64_t i)
 	{
 #ifdef _DEBUG
 		assert(i >= 0);
@@ -692,7 +581,7 @@ private:
 		rebalance(i);
 	}
 
-	void insert_after(int64_t i, KeyType key, ValueType val)
+	constexpr void insert_after(int64_t i, KeyType key, ValueType val)
 	{
 #ifdef _DEBUG
 		assert(i >= -1);
